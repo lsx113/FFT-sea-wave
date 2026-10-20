@@ -51,19 +51,33 @@ public class OceanSurface : MonoBehaviour
             return;
         }
 
-        // 三级联各自三张纹理：顶点位移、斜率、泡沫
-        boundMaterial.SetTexture("_Displacement_c0", wavesGenerator.Cascade0.Displacement);
-        boundMaterial.SetTexture("_Derivatives_c0", wavesGenerator.Cascade0.Derivatives);
-        boundMaterial.SetTexture("_Turbulence_c0", wavesGenerator.Cascade0.Turbulence);
-
-        boundMaterial.SetTexture("_Displacement_c1", wavesGenerator.Cascade1.Displacement);
-        boundMaterial.SetTexture("_Derivatives_c1", wavesGenerator.Cascade1.Derivatives);
-        boundMaterial.SetTexture("_Turbulence_c1", wavesGenerator.Cascade1.Turbulence);
-
-        boundMaterial.SetTexture("_Displacement_c2", wavesGenerator.Cascade2.Displacement);
-        boundMaterial.SetTexture("_Derivatives_c2", wavesGenerator.Cascade2.Derivatives);
-        boundMaterial.SetTexture("_Turbulence_c2", wavesGenerator.Cascade2.Turbulence);
-
+        BindTextures(wavesGenerator, boundMaterial);
         isBound = true;
+    }
+
+    /// <summary>
+    /// 把三级联的 9 张纹理绑到任意一个海面材质上。
+    /// 做成静态方法是因为 <see cref="OceanGeometry"/>（clipmap 网格）自己创建子物体和材质，
+    /// 也要绑同样的纹理 —— 两边共用一份代码，避免属性名写岔。
+    /// </summary>
+    public static bool BindTextures(WavesGenerator wavesGenerator, Material material)
+    {
+        if (wavesGenerator == null || material == null || wavesGenerator.Cascade0 == null)
+            return false;
+
+        // 三级联各自三张纹理：顶点位移、斜率、泡沫
+        material.SetTexture("_Displacement_c0", wavesGenerator.Cascade0.Displacement);
+        material.SetTexture("_Derivatives_c0", wavesGenerator.Cascade0.Derivatives);
+        material.SetTexture("_Turbulence_c0", wavesGenerator.Cascade0.Turbulence);
+
+        material.SetTexture("_Displacement_c1", wavesGenerator.Cascade1.Displacement);
+        material.SetTexture("_Derivatives_c1", wavesGenerator.Cascade1.Derivatives);
+        material.SetTexture("_Turbulence_c1", wavesGenerator.Cascade1.Turbulence);
+
+        material.SetTexture("_Displacement_c2", wavesGenerator.Cascade2.Displacement);
+        material.SetTexture("_Derivatives_c2", wavesGenerator.Cascade2.Derivatives);
+        material.SetTexture("_Turbulence_c2", wavesGenerator.Cascade2.Turbulence);
+
+        return true;
     }
 }

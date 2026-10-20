@@ -1,0 +1,44 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: CloudySky
+  m_Shader: {fileID: 4800000, guid: e660629abef748a499067bca255ac353, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs: []
+    m_Ints: []
+    m_Floats:
+    - _CloudContrast: 0.26
+    - _CloudCoverage: 0.5
+    - _CloudScale: 0.75
+    - _CloudSpeed: 0.012
+    - _SunDiscIntensity: 3.4202414
+    - _SunDiscSize: 0.0015
+    - _SunGlowPower: 20
+    - _SunGlowStrength: 0.61564344
+    m_Colors:
+    - _CloudColor: {r: 1, g: 0.8, b: 0.62, a: 1}
+    - _CloudShadowColor: {r: 0.34, g: 0.28, b: 0.38, a: 1}
+    - _HorizonColor: {r: 0.92, g: 0.62, b: 0.42, a: 1}
+    - _SunDirection: {r: 0.25563264, g: 0.15643448, b: 0.9540338, a: 0}
+    - _SunGlowColor: {r: 1, g: 0.72, b: 0.39999998, a: 1}
+    - _ZenithColor: {r: 0.13, g: 0.19, b: 0.36, a: 1}
+  m_BuildTextureStacks: []
+  m_AllowLocking: 1

@@ -51,6 +51,21 @@ public class WavesGenerator : MonoBehaviour
     public WavesCascade Cascade1 => cascade1;
     public WavesCascade Cascade2 => cascade2;
 
+    /// <summary>波谱参数资产。调试面板（<see cref="OceanTuning"/>）改风速/风向要用它。</summary>
+    public WavesSettings Settings => wavesSettings;
+
+    /// <summary>
+    /// 按当前的波谱参数重算三个级联的初始频谱。
+    /// 改风速 / 风向 / λ / 短波衰减之后必须调一次，否则海面还是旧参数的形状。
+    /// </summary>
+    public void RecalculateInitials()
+    {
+        if (cascade0 == null || wavesSettings == null)
+            return;
+
+        InitialiseCascades();
+    }
+
     WavesCascade cascade0;
     WavesCascade cascade1;
     WavesCascade cascade2;

@@ -66,21 +66,27 @@ Material:
     m_Ints: []
     m_Floats:
     - _ContactFoam: 0
-    - _FoamBiasLOD0: 0.84
-    - _FoamBiasLOD1: 1.83
-    - _FoamBiasLOD2: 2.72
-    - _FoamScale: 0
+    - _DetailNormalStrength: 0.15
+    - _DetailScale: 1.8
+    - _FoamBiasLOD0: 0.3
+    - _FoamBiasLOD1: 1.15
+    - _FoamBiasLOD2: 2.1
+    - _FoamDirection: 150
+    - _FoamNoiseScale: 2.2
+    - _FoamNoiseStrength: 0.09
+    - _FoamScale: 13.4
+    - _FoamStretch: 2.6
     - _LOD_scale: 7.13
-    - _MaxGloss: 0.91
-    - _Roughness: 0.311
+    - _MaxGloss: 0.56
+    - _Roughness: 0.16
     - _RoughnessScale: 0.0044
     - _SSSBase: -0.1
     - _SSSScale: 4.8
-    - _SSSStrength: 0.133
+    - _SSSStrength: 0.07
     m_Colors:
-    - _Color: {r: 0.035, g: 0.12299997, b: 0.19799995, a: 1}
+    - _Color: {r: 0.09999994, g: 0.23999992, b: 0.39999995, a: 1}
     - _FoamColor: {r: 1, g: 1, b: 1, a: 1}
-    - _ReflectionColor: {r: 0.54999995, g: 0.7, b: 0.85, a: 1}
-    - _SSSColor: {r: 0.15399995, g: 0.886, b: 0.98999995, a: 1}
+    - _ReflectionColor: {r: 0.97999996, g: 0.76, b: 0.58, a: 1}
+    - _SSSColor: {r: 0.3, g: 0.55, b: 0.45, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

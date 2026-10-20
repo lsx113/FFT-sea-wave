@@ -14,16 +14,16 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::WavesSettings
   g: 9.81
   depth: 500
-  lambda: 1
+  lambda: 0.9
   local:
     scale: 1
-    windSpeed: 0.5
-    windDirection: -29.81
+    windSpeed: 9
+    windDirection: 0
     fetch: 100000
     spreadBlend: 1
     swell: 0.198
     peakEnhancement: 3.3
-    shortWavesFade: 0.01
+    shortWavesFade: 0.05
   swell:
     scale: 0
     windSpeed: 1

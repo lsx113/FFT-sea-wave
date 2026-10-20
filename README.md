@@ -12,9 +12,24 @@
 
 1. 打开 `Assets/Scenes/SampleScene.unity`
 2. 点 Play
-3. 想调水面效果：选中 `/Ocean`，改材质 `Assets/Materials/Ocean.mat`
-4. 想调海浪形状：选中 `/Waves`，改 `WavesGenerator` 上的参数；
-   风速/风向/风程在 `Assets/Settings/WavesSettings.asset`
+3. 想调参数：选中 `/Ocean`，在 `OceanTuning` 组件上拖滑条，海面会立刻跟着变
+   （波形、水色、高光、泡沫都在里面）
+4. 想在场景里飞着看：Play 之后用 `Main Camera` 上的 `FreeCamera`
+
+> 运行时拖动 `OceanTuning` 改的只是内存里的值，退出 Play 就还原。
+> 调满意了在组件右上角菜单点 **「保存参数到资产」**，或者照抄到 Inspector 里。
+
+### 自由相机操作
+
+| 按键 | 作用 |
+|------|------|
+| 按住鼠标右键拖动 | 转视角（按住时锁定光标，松开释放） |
+| `W` / `A` / `S` / `D` | 前进 / 左移 / 后退 / 右移（沿视线，抬头就一直往上飞） |
+| `E` / `Q`、`Space` / `Ctrl` | 上升 / 下降 |
+| 按住 `Shift` | 加速 |
+| 滚轮 | 调基础飞行速度 |
+
+屏幕左上角有速度 / 坐标 / 操作提示。海面 clipmap 跟着相机走，飞到哪儿近处都有细网格。
 
 ---
 
@@ -23,6 +38,10 @@
 | 文件 | 作用 |
 |------|------|
 | `Assets/Scripts/OceanGrid.cs` | 程序化生成正方形海面网格（按「米」配置尺寸与格子大小） |
+| `Assets/Scripts/OceanGeometry.cs` | 运行时拼出可见海面：多层 clipmap 瓦片 + 补缝的 collar 环，跟着相机走的近处细、远处粗 |
+| `Assets/Scripts/OceanTuning.cs` | 运行时调参面板（滑条直接写进材质 / 波谱），可一键写回资产 |
+| `Assets/Scripts/FreeCamera.cs` | 自由飞行相机 |
+| `Assets/Scripts/SkySunSync.cs` | 把主方向光的朝向同步成天空盒里的太阳方向（日落就是靠它） |
 | `Assets/Scripts/WavesGenerator.cs` | 总调度：建噪声、建三个级联、每帧推进时间、可选 CPU 读回 |
 | `Assets/Scripts/WavesCascade.cs` | 单个级联：初始频谱 + 每帧 4 次逆 FFT + 合并纹理 |
 | `Assets/Scripts/FastFourierTransform.cs` | GPU 二维 FFT 的 C# 封装（乒乓缓冲 + 旋转因子查表） |
@@ -33,6 +52,7 @@
 | `Assets/ComputeShaders/FastFourierTransform.compute` | 水平/垂直蝶形运算、归一化、拼缝处理 |
 | `Assets/ComputeShaders/WavesTexturesMerger.compute` | 把 4 组 IFFT 结果合并成位移、斜率、泡沫三张纹理 |
 | `Assets/Shaders/Ocean.shader` | URP 海面着色器（顶点位移 + 法线/泡沫/菲涅尔/SSS + 深度 Pass） |
+| `Assets/Shaders/CloudySky.shader` | 程序化天空盒：FBM 值噪声画云 + 日落光晕 / 日盘，不用任何贴图 |
 
 ---
 
@@ -68,16 +88,51 @@ OceanSurface.cs ──► Ocean.shader
 
 | 级联 | LengthScale | 负责 |
 |------|-------------|------|
-| 0 | 250 m | 大尺度涌浪 |
+| 0 | 380 m | 大尺度涌浪 |
 | 1 | 17 m | 中尺度风浪 |
 | 2 | 5 m | 近处细浪 |
+
+级联 0 拉大到 380 m 是为了让 1 级（17 m）与 0 级之间有足够多的中间波长，
+浪看起来是「一层层涌过来」而不是只有细碎的小浪。
 
 渲染时按到相机的距离给每一级一个权重 `lod = min(LOD_scale × LengthScale / 距离, 1)`，
 远处的细节自动淡出。
 
 ---
 
+## 日落是怎么做的
+
+场景里没有额外的灯光，只有原本那盏 `Directional Light`：
+
+| 对象 | 设置 |
+|------|------|
+| `Directional Light` | 旋转 `(9, 195, 0)`，颜色 `(1.0, 0.66, 0.42)`，强度 1.8 |
+| `CloudySky.mat`（天空盒） | 天顶偏紫蓝、地平线橙、云被染成暖白；`_SunDiscSize 0.0015`、`_SunGlowPower 20` |
+| `Directional Light` 上的 `SkySunSync` | 每帧把 `-transform.forward` 写进天空盒的 `_SunDirection` |
+
+要点：
+
+- `transform.forward` 是**光线传播方向**，太阳在反方向，所以要取反。
+- 天空盒着色器不能读 `_MainLightPosition`——那是 URP 在画受光物体时才写的全局量，
+  画天空盒时它还是 0，光晕会完全算不出来。所以方向由 `SkySunSync` 从 C# 写进材质。
+- 太阳贴近地平线时 `SkySunSync` 会自动压暗光晕与日盘，避免「太阳已经落下天上还挂着一团亮」。
+- 想换成别的时段：只改这盏灯的旋转即可，颜色 / 强度 / 天空盒配色跟着微调，海面的反射色也最好一起改。
+
+---
+
 ## 常用参数
+
+**`OceanTuning`（挂在 `/Ocean`，Play 模式下调）**
+
+| 参数分组 | 有什么 |
+|----------|--------|
+| 波形 | `windSpeed` 风速、`windDirection` 风向、`lambda` 水平位移强度、`shortWavesFade` 短波衰减 |
+| 水面颜色 | `waterColor` 水体底色、`reflectionColor` 掠射反射色 |
+| 高光 / 细节 | `maxGloss` 高光锐度、`roughness` 远处粗糙度、`detailNormalStrength` / `detailScale` 高频碎波法线 |
+| 泡沫 | `foamScale` 浓度、`foamBiasLOD0/1/2` 远中近三档阈值（越小泡沫越多）、噪声尺度 / 强度 / 拉丝方向 |
+
+改 `windSpeed` / `windDirection` / `lambda` / `shortWavesFade` 之后会按每秒约 5 次的频率
+重算初始频谱（重算比较贵，所以做成节流）。
 
 **`WavesGenerator`（挂在 `/Waves`）**
 
@@ -104,8 +159,16 @@ OceanSurface.cs ──► Ocean.shader
 | `_Color` | 水体颜色 |
 | `_ReflectionColor` | 掠射角时的反射色（近似天空） |
 | `_FoamScale` / `_FoamBiasLOD*` | 泡沫多少。调大 bias = 更少泡沫 |
+| `_FoamNoiseScale` / `_FoamNoiseStrength` | 泡沫边缘的碎纹，避免泡沫像一块白漆 |
+| `_FoamStretch` / `_FoamDirection` | 顺着风向把泡沫拉成条状 |
+| `_DetailNormalStrength` / `_DetailScale` | 高频碎波法线，近处水面的「颗粒感」 |
 | `_LOD_scale` | 细节随距离衰减的快慢 |
 | `_ContactFoam` | 岸边接触泡沫，需要场景里有水下地形；纯海面保持 0 |
+
+> 避坑：**不要在 Play 模式里直接改 `Ocean.mat` 资产或改它的着色器**。
+> 材质被重新导入时，运行时塞进去的级联 RenderTexture 引用会失效，
+> 海面会突然变成一块平面的灰色，而且 `GetTexture() != null` 还检测不出来。
+> `OceanGeometry` 现在每帧都重新绑一次纹理来兜底，但调参还是用 `OceanTuning` 最省事。
 
 ---
 
@@ -133,3 +196,7 @@ OceanSurface.cs ──► Ocean.shader
 - 网格包围盒在竖直方向留了 ±50 m 余量，否则大浪会把网格挤出视锥被剔除。
 - URP Asset 里已勾选 **Depth Texture**（`Assets/Settings/PC_RPAsset.asset`），
   岸边泡沫和深度 Pass 依赖它。
+- `PlayerSettings.runInBackground` 已打开。编辑器失去焦点时默认会停掉播放循环，
+  用命令行 / 外部工具截图或改参数时会看到「改了没反应」，实际是根本没在跑。
+- 改脚本后要 **先退出 Play 再重新编译**。在 Play 中途热重载会让 `WavesGenerator`
+  的级联变成 null，控制台刷 `NullReferenceException`。
