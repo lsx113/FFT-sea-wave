@@ -1,0 +1,194 @@
+// 初始波谱：把「风速 + 风程」这样的物理参数，转换成一张频域里的复数振幅图 H0
+//
+// 这个文件只在启动时（或改参数时）跑一次，结果存进 H0 纹理。
+// 之后每帧只需要用时间推进相位（见 TimeDependentSpectrum.compute），不用重算波谱。
+//
+// 频谱用 JONSWAP 模型：描述「能量在不同频率上怎么分布」，峰值频率由风速和风程决定。
+// 方向分布用 Donelan-Banner / cosine-2s 两种模型混合，再由 swell 参数控制涌浪程度。
+// 最后乘一个高斯噪声，让每个频率分量的相位随机化——否则整片海会像整齐的条纹。
+
+#pragma kernel CalculateInitialSpectrum
+#pragma kernel CalculateConjugatedSpectrum
+
+static const float PI = 3.1415926;
+
+RWTexture2D<float4> H0;      // 结果：xy = 本频率的复数振幅，zw = 相反波矢(-k)的共轭
+RWTexture2D<float4> WavesData; // 预计算结果：x=k.x, y=1/|k|, z=k.z, w=角频率 ω
+RWTexture2D<float2> H0K;     // 中间结果：未加共轭的 H0(k)
+
+Texture2D<float2> Noise;     // 高斯噪声纹理（生成时写入随机数）
+uint Size;                   // 频谱纹理边长（必须是 2 的幂）
+float LengthScale;           // 这个级联代表的海面尺寸（米）
+float CutoffHigh;            // 只保留 |k| 小于它的频率（大波，本级联负责）
+float CutoffLow;             // 只保留 |k| 大于它的频率（小波交给下一级联）
+float GravityAcceleration;
+float Depth;
+
+// GPU 结构体布局：8 个 float 对齐到 32 字节，C# 端要用同样的结构
+struct SpectrumParameters
+{
+	float scale;          // 该频谱的整体缩放
+	float angle;          // 风向（弧度）
+	float spreadBlend;    // 方向分布混合权重：0=cos²，1=cos-2s
+	float swell;          // 涌浪强度
+	float alpha;          // JONSWAP 的 α（由风速/风程推出）
+	float peakOmega;      // 峰值角频率 ωp
+	float gamma;          // 峰值增强系数
+	float shortWavesFade; // 短波衰减尺度
+};
+
+StructuredBuffer<SpectrumParameters> Spectrums;
+
+// 深水色散关系 ω = sqrt(g*k)，浅水用 tanh(k*depth) 修正（depth 很大时退化为深水）
+float Frequency(float k, float g, float depth)
+{
+	return sqrt(g * k * tanh(min(k * depth, 20)));
+}
+
+// dω/dk，后面要把「频率谱」换算成「波数谱」时需要
+float FrequencyDerivative(float k, float g, float depth)
+{
+	float th = tanh(min(k * depth, 20));
+	float ch = cosh(k * depth);
+	return g * (depth * k / ch / ch + th) / Frequency(k, g, depth) / 2;
+}
+
+// cos-2s 方向分布的归一化系数（经验拟合，无需现场积分）
+float NormalisationFactor(float s)
+{
+	float s2 = s * s;
+	float s3 = s2 * s;
+	float s4 = s3 * s;
+	if (s < 5)
+		return -0.000564 * s4 + 0.00776 * s3 - 0.044 * s2 + 0.192 * s + 0.163;
+	else
+		return -4.80e-08 * s4 + 1.07e-05 * s3 - 9.53e-04 * s2 + 5.90e-02 * s + 3.93e-01;
+}
+
+// Donelan-Banner 方向分布的形状参数 β（随风速比变化）
+float DonelanBannerBeta(float x)
+{
+	if (x < 0.95)
+		return 2.61 * pow(abs(x), 1.3);
+	if (x < 1.6)
+		return 2.28 * pow(abs(x), -1.3);
+	float p = -0.4 + 0.8393 * exp(-0.567 * log(x * x));
+	return pow(10, p);
+}
+
+float DonelanBanner(float theta, float omega, float peakOmega)
+{
+	float beta = DonelanBannerBeta(omega / peakOmega);
+	float sech = 1 / cosh(beta * theta);
+	return beta / 2 / tanh(beta * 3.1416) * sech * sech;
+}
+
+float Cosine2s(float theta, float s)
+{
+	return NormalisationFactor(s) * pow(abs(cos(0.5 * theta)), 2 * s);
+}
+
+// 方向扩散指数 s：频率高于峰值时更窄（涌浪更集中），低于峰值时更宽
+float SpreadPower(float omega, float peakOmega)
+{
+	if (omega > peakOmega)
+	{
+		return 9.77 * pow(abs(omega / peakOmega), -2.5);
+	}
+	else
+	{
+		return 6.97 * pow(abs(omega / peakOmega), 5);
+	}
+}
+
+// 把「cos²」和「cos-2s」两种方向分布按 spreadBlend 混合，swell 让分布更窄（更像涌浪）
+float DirectionSpectrum(float theta, float omega, SpectrumParameters pars)
+{
+	float s = SpreadPower(omega, pars.peakOmega)
+		+ 16 * tanh(min(omega / pars.peakOmega, 20)) * pars.swell * pars.swell;
+	return lerp(2 / 3.1415 * cos(theta) * cos(theta), Cosine2s(theta - pars.angle, s), pars.spreadBlend);
+}
+
+// TMA 浅水修正：水深有限时高频成分被削弱
+float TMACorrection(float omega, float g, float depth)
+{
+	float omegaH = omega * sqrt(depth / g);
+	if (omegaH <= 1)
+		return 0.5 * omegaH * omegaH;
+	if (omegaH < 2)
+		return 1.0 - 0.5 * (2.0 - omegaH) * (2.0 - omegaH);
+	return 1;
+}
+
+// JONSWAP 频谱本体：能量按 ω 的 5 次方衰减，峰值附近按 γ^r 抬高
+float JONSWAP(float omega, float g, float depth, SpectrumParameters pars)
+{
+	float sigma;
+	if (omega <= pars.peakOmega)
+		sigma = 0.07;
+	else
+		sigma = 0.09;
+	float r = exp(-(omega - pars.peakOmega) * (omega - pars.peakOmega)
+		/ 2 / sigma / sigma / pars.peakOmega / pars.peakOmega);
+
+	float oneOverOmega = 1 / omega;
+	float peakOmegaOverOmega = pars.peakOmega / omega;
+	return pars.scale * TMACorrection(omega, g, depth) * pars.alpha * g * g
+		* oneOverOmega * oneOverOmega * oneOverOmega * oneOverOmega * oneOverOmega
+		* exp(-1.25 * peakOmegaOverOmega * peakOmegaOverOmega * peakOmegaOverOmega * peakOmegaOverOmega)
+		* pow(abs(pars.gamma), r);
+}
+
+// 短波衰减：波长太短的成分直接压掉，避免网格分辨率不够时出现闪烁
+float ShortWavesFade(float kLength, SpectrumParameters pars)
+{
+	return exp(-pars.shortWavesFade * pars.shortWavesFade * kLength * kLength);
+}
+
+// 第一步：算出每个频率格点的 H0(k)
+// 每个线程负责频谱图上的一个格子；格子中心对应的波矢 k 由「格点索引 - N/2」决定，
+// 这样 k=0 落在纹理中央（直流分量）。
+[numthreads(8, 8, 1)]
+void CalculateInitialSpectrum(uint3 id : SV_DispatchThreadID)
+{
+	float deltaK = 2 * PI / LengthScale;   // 相邻格点的波数间隔
+	int nx = id.x - Size / 2;
+	int nz = id.y - Size / 2;
+	float2 k = float2(nx, nz) * deltaK;
+	float kLength = length(k);
+
+	// 只保留本级联负责的波数区间，区间外的格子留 0
+	if (kLength <= CutoffHigh && kLength >= CutoffLow)
+	{
+		float kAngle = atan2(k.y, k.x);
+		float omega = Frequency(kLength, GravityAcceleration, Depth);
+		WavesData[id.xy] = float4(k.x, 1 / kLength, k.y, omega);
+		float dOmegadk = FrequencyDerivative(kLength, GravityAcceleration, Depth);
+
+		// 主波场 + （可选的）涌浪波场，两者叠加
+		float spectrum = JONSWAP(omega, GravityAcceleration, Depth, Spectrums[0])
+			* DirectionSpectrum(kAngle, omega, Spectrums[0]) * ShortWavesFade(kLength, Spectrums[0]);
+		if (Spectrums[1].scale > 0)
+			spectrum += JONSWAP(omega, GravityAcceleration, Depth, Spectrums[1])
+			* DirectionSpectrum(kAngle, omega, Spectrums[1]) * ShortWavesFade(kLength, Spectrums[1]);
+
+		// 振幅 = 高斯随机数 × sqrt(2 * 频谱能量 * 频率到波数的雅可比)，即 1/sqrt(2)·(ξ+iη)·sqrt(S)
+		H0K[id.xy] = float2(Noise[id.xy].x, Noise[id.xy].y)
+			* sqrt(2 * spectrum * abs(dOmegadk) / kLength * deltaK * deltaK);
+	}
+	else
+	{
+		H0K[id.xy] = 0;
+		WavesData[id.xy] = float4(k.x, 1, k.y, 0);
+	}
+}
+
+// 第二步：实值波面要求频谱满足共轭对称 H(-k) = conj(H(k))，
+// 预先把「相反波矢」的那一半也存好，每帧就不用再查了。
+[numthreads(8,8,1)]
+void CalculateConjugatedSpectrum(uint3 id : SV_DispatchThreadID)
+{
+	float2 h0K = H0K[id.xy];
+	float2 h0MinusK = H0K[uint2((Size - id.x) % Size, (Size - id.y) % Size)];
+	H0[id.xy] = float4(h0K.x, h0K.y, h0MinusK.x, -h0MinusK.y);
+}

@@ -1,0 +1,40 @@
+// 逆 FFT 之后的收尾：把 4 张复数纹理合并成渲染真正要用的 3 张纹理
+//
+//   Displacement (RGBA32F)：xyz = 顶点位移（米）
+//   Derivatives  (RGBA32F)：xy = 斜率 ∂y/∂x, ∂y/∂z，zw = 二阶导
+//   Turbulence   (RGBA32F)：r = 雅可比行列式（用来判断这里是不是「被挤压」→ 泡沫）
+//
+// 雅可比行列式 J = (1+λ·∂²x/∂x²)(1+λ·∂²z/∂z²) - λ²·(∂y/∂x)²
+// J < 1 表示水平方向被压缩（波峰附近的挤压），越小越容易起白沫。
+
+#pragma kernel FillResultTextures
+
+RWTexture2D<float3> Displacement;
+RWTexture2D<float4> Derivatives;
+RWTexture2D<float4> Turbulence;
+
+Texture2D<float2> Dx_Dz;
+Texture2D<float2> Dy_Dxz;
+Texture2D<float2> Dyx_Dyz;
+Texture2D<float2> Dxx_Dzz;
+
+float Lambda;     // 水平位移强度（0 = 只有竖直起伏，1 = 完全按物理水平偏移）
+float DeltaTime;
+
+[numthreads(8, 8, 1)]
+void FillResultTextures(uint3 id : SV_DispatchThreadID)
+{
+	float2 DxDz = Dx_Dz[id.xy];
+	float2 DyDxz = Dy_Dxz[id.xy];
+	float2 DyxDyz = Dyx_Dyz[id.xy];
+	float2 DxxDzz = Dxx_Dzz[id.xy];
+
+	Displacement[id.xy] = float3(Lambda * DxDz.x, DyDxz.x, Lambda * DxDz.y);
+	Derivatives[id.xy] = float4(DyxDyz, DxxDzz * Lambda);
+
+	float jacobian = (1 + Lambda * DxxDzz.x) * (1 + Lambda * DxxDzz.y) - Lambda * Lambda * DyDxz.y * DyDxz.y;
+
+	// 泡沫累积：被挤压的地方随时间不断累积，恢复后缓慢消退
+	Turbulence[id.xy] = Turbulence[id.xy].r + DeltaTime * 0.5 / max(jacobian, 0.5);
+	Turbulence[id.xy] = min(jacobian, Turbulence[id.xy].r);
+}

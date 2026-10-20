@@ -1,0 +1,143 @@
+// GPU 上的二维快速傅里叶变换（FFT / IFFT）
+//
+// 思路：把 N×N 的二维变换拆成「先对每一行做一维 FFT，再对每一列做一维 FFT」。
+// 一维 FFT 用基 2 的迭代蝶形算法，共 log2(N) 步；每一步读一张纹理、写另一张纹理，
+// 两张纹理来回倒（ping-pong），所以不需要中间缓冲。
+//
+// 蝶形公式：out[i] = in[a] + w * in[b]，其中 w 是旋转因子（twiddle factor），
+// a/b 是这一步要配对的两个下标。把 w 和 a/b 预先算好存进 PrecomputedData 纹理，
+// 之后每个 pass 只做查表和一次复数乘法，省掉三角函数。
+
+#pragma kernel PrecomputeTwiddleFactorsAndInputIndices
+#pragma kernel HorizontalStepFFT
+#pragma kernel VerticalStepFFT
+#pragma kernel HorizontalStepInverseFFT
+#pragma kernel VerticalStepInverseFFT
+#pragma kernel Scale
+#pragma kernel Permute
+
+static const float PI = 3.1415926;
+
+RWTexture2D<float4> PrecomputeBuffer;   // 预计算输出：xy=旋转因子，zw=两个输入下标
+Texture2D<float4> PrecomputedData;      // 预计算结果的只读视图
+RWTexture2D<float2> Buffer0;            // ping-pong 用的两张复数纹理
+RWTexture2D<float2> Buffer1;
+bool PingPong;                          // true 表示这一步从 Buffer0 读、写 Buffer1
+uint Step;                              // 当前是第几步蝶形（0..log2(Size)-1）
+uint Size;                              // 纹理边长 N
+
+// 复数乘法 (a + bi)(c + di)
+float2 ComplexMult(float2 a, float2 b)
+{
+	return float2(a.r * b.r - a.g * b.g, a.r * b.g + a.g * b.r);
+}
+
+// 复数指数 exp(a.x + i*a.y) = e^(a.x) * (cos(a.y) + i sin(a.y))
+float2 ComplexExp(float2 a)
+{
+	return float2(cos(a.y), sin(a.y)) * exp(a.x);
+}
+
+// 预计算：对每个 Step 和每个下标，算出旋转因子和蝶形的两个输入下标
+// 输出纹理尺寸 logSize × Size，第 id.x 行对应第 id.x 步。
+[numthreads(1, 8, 1)]
+void PrecomputeTwiddleFactorsAndInputIndices(uint3 id : SV_DispatchThreadID)
+{
+	uint b = Size >> (id.x + 1);                       // 这一步蝶形两点的间距
+	float2 mult = 2 * PI * float2(0, 1) / Size;
+
+	// i 是配对后「下面」那个点的原始下标，(i + b) 是「上面」那个点
+	uint i = (2 * b * (id.y / b) + id.y % b) % Size;
+
+	// 旋转因子 w = exp(-2πi * k / N)，负号表示正变换（逆变换时在采样处取共轭）
+	float2 twiddle = ComplexExp(-mult * ((id.y / b) * b));
+
+	PrecomputeBuffer[id.xy] = float4(twiddle.x, twiddle.y, i, i + b);
+	// 上半张表旋转因子取负，等价于相位加 π；配合下面的竖直偏移使用
+	PrecomputeBuffer[uint2(id.x, id.y + Size / 2)] = float4(-twiddle.x, -twiddle.y, i, i + b);
+}
+
+// 水平方向的一步蝶形：同一行（同一个 y）里配对
+[numthreads(8, 8, 1)]
+void HorizontalStepFFT (uint3 id : SV_DispatchThreadID)
+{
+	float4 data = PrecomputedData[uint2(Step, id.x)];
+	uint2 inputsIndices = (uint2)data.ba;
+	if (PingPong)
+	{
+		Buffer1[id.xy] = Buffer0[uint2(inputsIndices.x, id.y)]
+			+ ComplexMult(data.rg, Buffer0[uint2(inputsIndices.y, id.y)]);
+	}
+	else
+	{
+		Buffer0[id.xy] = Buffer1[uint2(inputsIndices.x, id.y)]
+			+ ComplexMult(data.rg, Buffer1[uint2(inputsIndices.y, id.y)]);
+	}
+}
+
+// 竖直方向的一步蝶形：同一列里配对
+[numthreads(8, 8, 1)]
+void VerticalStepFFT(uint3 id : SV_DispatchThreadID)
+{
+	float4 data = PrecomputedData[uint2(Step, id.y)];
+	uint2 inputsIndices = (uint2)data.ba;
+	if (PingPong)
+	{
+		Buffer1[id.xy] = Buffer0[uint2(id.x, inputsIndices.x)]
+			+ ComplexMult(data.rg, Buffer0[uint2(id.x, inputsIndices.y)]);
+	}
+	else
+	{
+		Buffer0[id.xy] = Buffer1[uint2(id.x, inputsIndices.x)]
+			+ ComplexMult(data.rg, Buffer1[uint2(id.x, inputsIndices.y)]);
+	}
+}
+
+// 逆变换：唯一的区别是把旋转因子取共轭（虚部取负），其余与正变换完全一致
+[numthreads(8, 8, 1)]
+void HorizontalStepInverseFFT(uint3 id : SV_DispatchThreadID)
+{
+	float4 data = PrecomputedData[uint2(Step, id.x)];
+	uint2 inputsIndices = (uint2)data.ba;
+	if (PingPong)
+	{
+		Buffer1[id.xy] = Buffer0[uint2(inputsIndices.x, id.y)]
+			+ ComplexMult(float2(data.r, -data.g), Buffer0[uint2(inputsIndices.y, id.y)]);
+	}
+	else
+	{
+		Buffer0[id.xy] = Buffer1[uint2(inputsIndices.x, id.y)]
+			+ ComplexMult(float2(data.r, -data.g), Buffer1[uint2(inputsIndices.y, id.y)]);
+	}
+}
+
+[numthreads(8, 8, 1)]
+void VerticalStepInverseFFT(uint3 id : SV_DispatchThreadID)
+{
+	float4 data = PrecomputedData[uint2(Step, id.y)];
+	uint2 inputsIndices = (uint2)data.ba;
+	if (PingPong)
+	{
+		Buffer1[id.xy] = Buffer0[uint2(id.x, inputsIndices.x)]
+			+ ComplexMult(float2(data.r, -data.g), Buffer0[uint2(id.x, inputsIndices.y)]);
+	}
+	else
+	{
+		Buffer0[id.xy] = Buffer1[uint2(id.x, inputsIndices.x)]
+			+ ComplexMult(float2(data.r, -data.g), Buffer1[uint2(id.x, inputsIndices.y)]);
+	}
+}
+
+// 归一化：逆变换结果要除以 N²（N×N 的二维 IDFT 定义）
+[numthreads(8, 8, 1)]
+void Scale(uint3 id : SV_DispatchThreadID)
+{
+	Buffer0[id.xy] = Buffer0[id.xy] / Size / Size;
+}
+
+// 频域符号翻转 (1 - 2*((x+y) mod 2))：把频谱搬移到纹理中心，避免网格拼接处出现接缝
+[numthreads(8, 8, 1)]
+void Permute(uint3 id : SV_DispatchThreadID)
+{
+	Buffer0[id.xy] = Buffer0[id.xy] * (1.0 - 2.0 * ((id.x + id.y) % 2));
+}

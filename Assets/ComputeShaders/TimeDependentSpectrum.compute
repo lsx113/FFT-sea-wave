@@ -1,0 +1,58 @@
+// 时间推进：把初始波谱按 ωt 旋转相位，得到「这一帧」的波面
+//
+// 每个格点对应一个波矢 k，它的振幅会随时间旋转：H(k,t) = H0(k)·e^{iωt} + conj(H0(-k))·e^{-iωt}
+// 这一步是纯复数乘法，非常便宜；真正贵的是后面的逆 FFT。
+//
+// 这里同时算出 4 组「需要做逆变换的量」，每一组都是一个复数场：
+//   Dx_Dz   → 水平位移 (x, z)，做完 IFFT 就是每个顶点的水平波动
+//   Dy_Dxz  → 竖直位移 y 和 ∂y/∂x
+//   Dyx_Dyz → ∂y/∂x 和 ∂y/∂z（算法线用）
+//   Dxx_Dzz → ∂²x/∂x² 和 ∂²z/∂z²（算雅可比行列式 → 泡沫用）
+
+#pragma kernel CalculateAmplitudes
+
+RWTexture2D<float2> Dx_Dz;
+RWTexture2D<float2> Dy_Dxz;
+RWTexture2D<float2> Dyx_Dyz;
+RWTexture2D<float2> Dxx_Dzz;
+
+Texture2D<float4> H0;         // xy = H0(k)，zw = conj(H0(-k))
+Texture2D<float4> WavesData;  // x=k.x, y=1/|k|, z=k.z, w=ω
+float Time;
+
+float2 ComplexMult(float2 a, float2 b)
+{
+	return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+[numthreads(8,8,1)]
+void CalculateAmplitudes(uint3 id : SV_DispatchThreadID)
+{
+	float4 wave = WavesData[id.xy];
+	float phase = wave.w * Time;
+
+	// e^{iωt} 和它的共轭 e^{-iωt}
+	float2 exponent = float2(cos(phase), sin(phase));
+	float2 h = ComplexMult(H0[id.xy].xy, exponent)
+		+ ComplexMult(H0[id.xy].zw, float2(exponent.x, -exponent.y));
+
+	// i·h：把复数乘 i 相当于在复平面上旋转 90°，用来把「高度」变成「位移梯度」
+	float2 ih = float2(-h.y, h.x);
+
+	float2 displacementX = ih * wave.x * wave.y;      // i·h·kx/|k|
+	float2 displacementY = h;                          // h
+	float2 displacementZ = ih * wave.z * wave.y;      // i·h·kz/|k|
+
+	float2 displacementX_dx = -h * wave.x * wave.x * wave.y;
+	float2 displacementY_dx = ih * wave.x;
+	float2 displacementZ_dx = -h * wave.x * wave.z * wave.y;
+
+	float2 displacementY_dz = ih * wave.z;
+	float2 displacementZ_dz = -h * wave.z * wave.z * wave.y;
+
+	// 打包成 4 组复数（每张纹理两个通道各存一个量），IFFT 之后再拆开
+	Dx_Dz[id.xy] = float2(displacementX.x - displacementZ.y, displacementX.y + displacementZ.x);
+	Dy_Dxz[id.xy] = float2(displacementY.x - displacementZ_dx.y, displacementY.y + displacementZ_dx.x);
+	Dyx_Dyz[id.xy] = float2(displacementY_dx.x - displacementY_dz.y, displacementY_dx.y + displacementY_dz.x);
+	Dxx_Dzz[id.xy] = float2(displacementX_dx.x - displacementZ_dz.y, displacementX_dx.y + displacementZ_dz.x);
+}

@@ -170,9 +170,16 @@ public class OceanGrid : MonoBehaviour
 
     Material ResolveMaterial()
     {
+        // 1) Inspector 上显式指定了材质，就用它（海面材质会走这条路）
         if (material != null)
             return material;
 
+        // 2) 渲染器上已经挂着一个有效材质（比如运行时由别的脚本换上的海面材质），不要覆盖它
+        Material current = Renderer.sharedMaterial;
+        if (current != null && current.shader != null && current != fallbackMaterial)
+            return current;
+
+        // 3) 什么都没有时，临时造一个 URP Lit 材质先让网格看得见
         if (fallbackMaterial == null)
         {
             Shader lit = Shader.Find("Universal Render Pipeline/Lit");
