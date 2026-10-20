@@ -1,0 +1,20 @@
+# Normalize line endings; Unity YAML stays LF so diffs/merges behave
+* text=auto
+
+*.cs     text diff=csharp
+*.shader text
+*.hlsl   text
+*.compute text
+*.cginc  text
+*.json   text
+*.unity  text eol=lf
+*.prefab text eol=lf
+*.asset  text eol=lf
+*.meta   text eol=lf
+
+*.png binary
+*.jpg binary
+*.exr binary
+*.fbx binary
+*.psd binary
+*.wav binary
