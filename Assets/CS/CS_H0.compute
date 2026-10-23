@@ -1,0 +1,563 @@
+﻿#pragma kernel CS_InitializeSpectrum//初始化频谱
+#pragma kernel CS_Spectrumtime
+#pragma kernel CS_FFTHorizontal
+#pragma kernel CS_FFTVertical
+#pragma kernel CS_UpdateFoam
+
+#define PI 3.14159265
+float _Resolution;
+float4 _LengthScale; // 4级级联的物理边长 L，打包进一个 float4
+                     // 注意：不能写成 float _LengthScale[4]，标量数组用 SetFloats 绑不上，
+                     // 只有第 0 个元素正确，后面全是垃圾值
+float _Gravity;
+float _WindSpeed;
+float2 _WindDir; // 归一化的风向 (Dx, Dz)
+float spreadPower; // 扩散指数上限 s_max（谱峰附近最窄，越远离谱峰越宽）
+
+RWTexture2DArray<float4> _InitialSpectrumTexture;
+// [公式] 伪随机数生成器 (基于整数哈希)
+float Hash(uint2 p)
+{
+    p = 1103515245U * ((p >> 1U) ^ p);
+    uint n = 1103515245U * ((p.x >> 1U) ^ p.y);
+    return float(n) * (1.0f / float(0xffffffffU));
+}
+
+// [公式] Box-Muller 变换：生成标准高斯随机数 (\xi_r, \xi_i)
+float2 GaussianRandom(uint2 id)
+{
+    float u1 = max(Hash(id), 1e-6); // 防止 log(0)
+    float u2 = Hash(id + uint2(1234, 5678));
+    float r = sqrt(-2.0 * log(u1));
+    float theta = 2.0 * 3.14159265 * u2;
+    return float2(r * cos(theta), r * sin(theta));
+}
+// [公式] 深水波色散关系：\omega = \sqrt{g |k|}
+float Dispersion(float kLength)
+{
+    return sqrt(_Gravity * kLength);
+}
+
+// [公式] 色散关系求导（雅可比转换）：\frac{d\omega}{dk} = \frac{1}{2}\sqrt{\frac{g}{k}}
+float DispersionDerivative(float kLength)
+{
+    if (kLength < 1e-6)
+        return 0.0;
+    return 0.5 * sqrt(_Gravity / kLength);
+}
+// [公式] JONSWAP 一维能量谱 S(\omega)
+float JONSWAP(float omega, float peakOmega, float gamma, float alpha)
+{
+    // 宽度参数 sigma：左侧 0.07，右侧 0.09
+    float sigma = (omega <= peakOmega) ? 0.07 : 0.09;
+    
+    // [公式] 峰值锐化项 r = exp( -(\omega - \omega_p)^2 / (2 \sigma^2 \omega_p^2) )
+    float r = exp(-pow(omega - peakOmega, 2.0) / (2.0 * sigma * sigma * peakOmega * peakOmega));
+    
+    // [公式] 基础包络指数项 exp( -1.25 (\omega_p / \omega)^4 )
+    float expTerm = exp(-1.25 * pow(peakOmega / omega, 4.0));
+    
+    // [公式] S(\omega) = (\alpha g^2 / \omega^5) * expTerm * \gamma^r
+    float Sw = (alpha * _Gravity * _Gravity / pow(omega, 5.0)) * expTerm * pow(abs(gamma), r);
+    return Sw;
+}
+
+// [公式] Mitsuyasu / Goda 的频率依赖扩散指数
+//   s(omega) = s_max * (omega / omega_p)^{+2.5}   omega <= omega_p
+//            = s_max * (omega / omega_p)^{-2.5}   omega >  omega_p
+// 谱峰处最窄（s 最大），往低频和高频两侧对称地变宽：
+// 长涌浪方向集中，高频短波则接近各向同性，真实海面就是这个规律。
+float SpreadingPower(float omega, float peakOmega, float sMax)
+{
+    float w = omega / max(peakOmega, 1e-6);
+    // w == 1 时 sign 返回 0，指数为 0，pow 返回 1，正好等于 sMax
+    return sMax * pow(w, -1.5 * sign(w - 1.0));
+}
+
+// [公式] cos^{2s}(\theta/2) 的归一化系数 1/N(s)
+// 精确值： 1/N = \Gamma(s+1) / (2\sqrt{\pi}\Gamma(s+1/2))
+// Stirling 主项近似 \sqrt{s}(1 + 1/(8s))：s >= 0.5 时误差 < 0.3%，
+// s = 0.22 时约 2%，够用；再加项反而在小 s 处更差，不要加。
+float DirectionNormalization(float s)
+{
+    // s 继续变小方向分布已趋近各向同性，钳住避免近似发散
+    s = max(s, 0.25);
+    return sqrt(s) * (1.0 + 1.0 / (8.0 * s)) / (2.0 * sqrt(PI));
+}
+
+// [公式] 方向扩散函数 D(\theta) = \cos^{2s}(\theta/2) / N(s)
+// 注意 s 现在逐像素变化（跟着 omega 走），所以归一化必须在 shader 里现算，
+// 不能再像之前那样在 C# 里算一次传进来。
+float DirectionSpectrum(float angle, float windAngle, float omega, float peakOmega, float sMax)
+{
+    float angleDiff = angle - windAngle;
+    // 将角度规整到 -PI 到 PI 之间
+    angleDiff = atan2(sin(angleDiff), cos(angleDiff));
+    float cosHalf = cos(angleDiff * 0.5f);
+    float s = SpreadingPower(omega, peakOmega, sMax);
+    return pow(abs(cosHalf), 2.0f * s) / DirectionNormalization(s);
+}
+
+// =====================================================================
+// [函数] 计算某个像素在某个级联上的初始振幅 H0（复数，xy = 实部/虚部）
+// =====================================================================
+// 抽成独立函数是为了让 kernel 能对「镜像像素 -k」再算一次。
+float2 ComputeH0(uint2 pid, uint cascade)
+{
+    // 级联的物理边长 L，以及频率步长 \Delta k = 2\pi / L
+    float L = _LengthScale[cascade];
+    float deltaK = 2.0f * PI / L;
+
+    // 像素坐标到物理波数 k = p * \Delta k
+    float2 p = float2(pid) - (_Resolution / 2.0f);
+    float2 k = p * deltaK;
+    float kLength = length(k);
+
+    // 截断阈值：防止 \frac{1}{k} 除零。截断区域的能量为 0
+    if (kLength < 1e-5)
+        return float2(0.0, 0.0);
+
+    // =====================================================================
+    // [公式] 物理参数计算
+    // =====================================================================
+    float omega = Dispersion(kLength);
+    float kAngle = atan2(k.y, k.x);
+    float dOmegadk = DispersionDerivative(kLength);
+
+    // JONSWAP 参数配置
+    float peakOmega = 0.877 * _Gravity / _WindSpeed; // [公式] 峰值频率 \omega_p
+    float alpha = 0.0081; // 经验常数 \alpha
+    float gamma = 3.3; // 峰值增强因子 \gamma
+
+    // =====================================================================
+    // [公式] 能量谱组合 (S(k) 的离散化转换)
+    // =====================================================================
+    float S_omega = JONSWAP(omega, peakOmega, gamma, alpha);
+    float windAngle = atan2(_WindDir.y, _WindDir.x);
+    float D_theta = DirectionSpectrum(kAngle, windAngle, omega, peakOmega, spreadPower);
+    float k_nyquist = PI * _Resolution / L; // 当前网格能表示的最高频率
+
+    // 一般让平滑在最高频率的 60% ~ 80% 处开始，就能完美去除噪点
+    float fadeStart = k_nyquist * 0.8f;
+
+    // 核心平滑公式：当 kLength 达到 fadeStart 时，能量开始以指数级暴跌
+    float shortWaveFade = exp(-pow(kLength / fadeStart, 2.0));
+
+    // =====================================================================
+    // [公式] 级联带通（高通部分）
+    // =====================================================================
+    // 下界 = 上一级网格的 Nyquist。更低頻的波上一级已经在算了，本级再算一遍就是重复。
+    // 上界 = 本级网格的 Nyquist，由上面的 shortWaveFade 负责。
+    // 少了这个高通，4 个级联装的就是同一个谱的 4 份拷贝：
+    // 叠加后浪高变成 4 倍，而且一级比一级细的短波全糊在一起，
+    // 看起来是尖刺山脉 + 撕裂，而不是海。
+    int ci = (int)cascade;
+    float prevL = _LengthScale[max(ci - 1, 0)];
+    float kBandMin = (ci > 0) ? (PI * _Resolution / prevL) : 0.0;
+
+    // 用 smoothstep 做柔和的高通，直接硬切会在空间域留下明显的振铃
+    float bandPass = (kBandMin > 0.0) ? smoothstep(kBandMin * 0.75, kBandMin * 1.25, kLength) : 1.0;
+
+    // 一维物理能量谱
+    float JONSSpectrum = S_omega * D_theta * shortWaveFade * bandPass;
+
+    // =====================================================================
+    // [公式] 终极组装 H0
+    // =====================================================================
+    // 雅可比行列式转换： d\omega/dk / kLength
+    float jacobian = abs(dOmegadk) / kLength;
+
+    // 离散积分面积微元： \Delta k * \Delta k
+    float areaTerm = deltaK * deltaK;
+
+    // 根号内部的能量： S(k) * (d\omega/dk / k) * \Delta k^2
+    // 这里不能再乘 2：+k 和 -k 两个方向的叠加由时间演化公式负责，
+    // 在这里再乘一次就是重复计算，会让波高虚高 sqrt(2) 倍（约 41%）。
+    float energyTerm = JONSSpectrum * jacobian * areaTerm;
+
+    // [公式] 高斯随机数 (\xi_r + i\xi_i) 乘以振幅
+    // 随机种子跟着 (pid, cascade) 走，纯函数性质就靠它保证
+    float2 gauss = GaussianRandom(pid + uint2(cascade * 100, cascade * 200));
+
+    // [公式] H0 = (1/\sqrt{2}) * (\xi_r + i\xi_i) * \sqrt{Energy}
+    // 代码里为了提取 1/\sqrt{2}，在 sqrt 内除以 2.0
+    return gauss * sqrt(energyTerm / 2.0);
+}
+
+[numthreads(8,8,1)]
+void CS_InitializeSpectrum(uint3 id : SV_DispatchThreadID)
+{
+    // 显式转成 float 和 _Resolution 同类型比较，避免 uint/float 混比的隐式转换警告。
+    // 注意是 >= 不是 >：分辨率 256 时合法 id 只有 0~255，id == 256 已经越界了
+    if ((float)id.x >= _Resolution || (float)id.y >= _Resolution)
+        return; // 超过分辨率直接退出
+
+    uint N = (uint)_Resolution;
+
+    // 级联循环
+    for (uint i = 0; i < 4; i++)
+    {
+        // k -> -k 的镜像像素：绕 k = 0（也就是像素 N/2）做点反射，等价于 id' = N - id。
+        // 用 % N 而不是 & (N-1)，这样 _Resolution 不是 2 的幂时也正确。
+        uint2 mirror = (uint2(N, N) - id.xy) % uint2(N, N);
+
+        float2 h0    = ComputeH0(id.xy, i);   // H0(k)
+        float2 h0neg = ComputeH0(mirror, i);  // H0(-k)，重算一次，和镜像线程算出的逐位相同
+
+        // R,G = H0(k) 的实部 / 虚部
+        // B,A = H0(-k) 的共轭（只把虚部取负）
+        _InitialSpectrumTexture[uint3(id.xy, i)] = float4(h0.x, h0.y, h0neg.x, -h0neg.y);
+    }
+}
+
+// =====================================================================
+// [Kernel] 时间演化 + 位移/斜率谱
+// =====================================================================
+RWTexture2DArray<float4> _SpectrumTexture; // 每个级联占 2 层：i*2 = 位移，i*2+1 = 斜率
+float _RepeatTime; // 循环周期 T：t = T 时海面与 t = 0 完全重合
+float _FrameTime;  // 当前循环周期内的时间 [0, _RepeatTime)，由 C# 取模后传入（不是 deltaTime！）
+
+// [函数] 欧拉公式 e^{i\theta} = cos\theta + i sin\theta
+// （教程里拼成了 EnlerFormula，这里保持同名，方便对照）
+float2 EnlerFormula(float theta)
+{
+    return float2(cos(theta), sin(theta));
+}
+
+// [函数] 复数乘法 (a.x + a.y*i)(b.x + b.y*i)
+float2 ComplexMul(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+[numthreads(8,8,1)]
+void CS_Spectrumtime(uint3 id : SV_DispatchThreadID)
+{
+    if ((float)id.x >= _Resolution || (float)id.y >= _Resolution)
+        return;
+
+    // [公式] 基频 w0 = 2\pi / T。把 \omega 量化成 w0 的整数倍，
+    // 保证 t = T 时每个波都正好绕回整数圈，海面能首尾无缝循环。
+    float w0 = 2.0f * PI / max(_RepeatTime, 1e-4);
+
+    for (uint i = 0; i < 4; i++)
+    {
+        float L = _LengthScale[i];
+
+        // 像素 -> 波数向量。k = 0 落在像素 (N/2, N/2)
+        float2 p = float2(id.xy) - (_Resolution / 2.0f);
+        float2 k = p * (2.0f * PI / L);
+        float kLength = length(k);
+        float kLengthRcp = 1.0f / max(kLength, 1e-5); // 中心像素 k=0，先钳住再取倒数
+
+        // [公式] 色散 \omega = sqrt(g|k|)，量化后乘累计时间得到相位
+        float dispersion = floor(sqrt(_Gravity * kLength) / w0) * w0 * _FrameTime;
+
+        float2 exponent = EnlerFormula(dispersion);
+
+        // 初始化时已经存好：RG = H0(k)，BA = conj(H0(-k))
+        float4 initial = _InitialSpectrumTexture[uint3(id.xy, i)];
+        float2 h0 = initial.xy;
+        float2 h0conju = initial.zw;
+
+        // [公式] h(k,t) = H0(k) e^{i\omega t} + conj(H0(-k)) e^{-i\omega t}
+        // 第二项把指数取共轭就是 e^{-i\omega t}
+        float2 htime = ComplexMul(h0, exponent) + ComplexMul(h0conju, float2(exponent.x, -exponent.y));
+        float2 ihtime = float2(-htime.y, htime.x); // = i * htime
+
+        // [公式] x,y,z 方向的位移谱
+        float2 displacementX = ihtime * k.x * kLengthRcp;
+        float2 displacementY = htime;
+        float2 displacementZ = ihtime * k.y * kLengthRcp;
+
+        // [公式] 偏导数谱：频域求导 = 时域乘 i k
+        float2 displacementX_dx = -htime * k.x * k.x * kLengthRcp;
+        float2 displacementY_dx = ihtime * k.x;
+
+        float2 displacementY_dz = k.y * ihtime;
+        float2 displacementZ_dz = -htime * k.y * k.y * kLengthRcp;
+
+        float2 displacementZ_dx = -htime * k.x * k.y * kLengthRcp;
+
+        // 打包成 (a + i*b)，一次 IFFT 出两个实场：
+        // 逆变换后 实部 -> a，虚部 -> b
+        float2 htimeDisplacementX = float2(displacementX.x - displacementZ.y, displacementX.y + displacementZ.x);
+        float2 htimeDisplacementZ = float2(displacementY.x - displacementZ_dx.y, displacementY.y + displacementZ_dx.x);
+
+        float2 htimeSlopeX = float2(displacementY_dx.x - displacementY_dz.y, displacementY_dx.y + displacementY_dz.x);
+        float2 htimeSlopeZ = float2(displacementX_dx.x - displacementZ_dz.y, displacementX_dx.y + displacementZ_dz.x);
+
+        // 每个级联占两层
+        _SpectrumTexture[uint3(id.xy, i * 2)]     = float4(htimeDisplacementX, htimeDisplacementZ);
+        _SpectrumTexture[uint3(id.xy, i * 2 + 1)] = float4(htimeSlopeX, htimeSlopeZ);
+    }
+}
+
+// =====================================================================
+// [Kernel] 二维逆 FFT：先按行、再按列，各做一遍 1D 变换
+// =====================================================================
+// 输入：_SpectrumTexture 8 层「频谱」，每层 float4 = 2 个复数 = 4 个打包的实场
+// 输出：还是那 8 层，但已经变成空域的位移 / 斜率
+//
+// 为什么要乘 (-1)^(x+y)：
+//   我们的谱是按「中心化」存的 —— 像素 (N/2,N/2) 才是 k=0，左边是负频率，
+//   而标准 FFT 要求下标 0 就是 k=0。频率下标整体平移 N/2 等价于空域乘 (-1)^n
+//   （FFT 平移性质）。漏了这一项，海面会逐像素正负交替，看起来像棋盘噪点。
+//
+// 为什么最后不做 1/N 归一化：
+//   H0 里已经乘过 Δk²（areaTerm），它就是积分 Σ h(k)e^{ikx} 的离散权重，
+//   所以这里要的就是「不除 N 的原始求和」。如果发现整体波高大了 N² 倍，再补。
+
+#define FFT_THREADS  256
+#define FFT_MAX_SIZE 512   // 线程数固定 256，靠 stride 循环支持到 512 点
+
+RWTexture2DArray<float4> _TempSpectrumTexture; // 行变换的中间结果
+groupshared float4 gFFT[FFT_MAX_SIZE];
+
+// [函数] 复数乘法
+float2 cmul(float2 a, float2 b)
+{
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// [函数] 对 groupshared 里的 gFFT[0..N-1] 就地做 1D 逆变换（正指数 e^{+i...}）
+// 注意：所有 GroupMemoryBarrierWithGroupSync 都在无条件分支上，
+// 保证整个线程组都走得到，否则行为未定义。
+void FFTInPlace(uint tid, uint N, uint logN)
+{
+    // 1) 位反转置换：DIT 要求输入先按比特反转排序
+    if (tid < N)
+    {
+        uint j = reversebits(tid) >> (32u - logN);
+        if (tid < j)
+        {
+            float4 tmp = gFFT[tid];
+            gFFT[tid] = gFFT[j];
+            gFFT[j]   = tmp;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 2) 蝶形：len 从 2 一路翻倍到 N
+    for (uint len = 2u; len <= N; len <<= 1u)
+    {
+        uint halfLen  = len >> 1u;
+        float angStep = 2.0f * PI / float(len); // 逆变换取 +i
+
+        for (uint b = tid; b < (N >> 1u); b += FFT_THREADS)
+        {
+            uint i = (b / halfLen) * len; // 这一组蝶形的起点
+            uint j = b % halfLen;         // 组内第几个
+
+            float ang = angStep * float(j);
+            float2 w  = float2(cos(ang), sin(ang));
+
+            float4 u = gFFT[i + j];
+            float4 t = gFFT[i + j + halfLen];
+            float4 v = float4(cmul(t.xy, w), cmul(t.zw, w)); // 两路复数并行
+
+            gFFT[i + j]           = u + v;
+            gFFT[i + j + halfLen] = u - v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// 行变换：一个线程组负责一行
+[numthreads(FFT_THREADS,1,1)]
+void CS_FFTHorizontal(uint3 id : SV_DispatchThreadID)
+{
+    uint N    = (uint)_Resolution;
+    uint logN = (uint)firstbithigh(N);
+    uint tid  = id.x;   // 行内下标
+    uint rowIdx = id.y;   // 行号
+    uint slice = id.z;  // 第几层
+
+    for (uint i = tid; i < N; i += FFT_THREADS)
+        gFFT[i] = _SpectrumTexture[uint3(i, rowIdx, slice)];
+    GroupMemoryBarrierWithGroupSync();
+
+    FFTInPlace(tid, N, logN);
+
+    for (uint j = tid; j < N; j += FFT_THREADS)
+        _TempSpectrumTexture[uint3(j, rowIdx, slice)] = gFFT[j];
+}
+
+// 列变换：一个线程组负责一列，写回时补上 (-1)^(x+y)
+[numthreads(FFT_THREADS,1,1)]
+void CS_FFTVertical(uint3 id : SV_DispatchThreadID)
+{
+    uint N    = (uint)_Resolution;
+    uint logN = (uint)firstbithigh(N);
+    uint tid  = id.x;
+    uint col  = id.y;   // 列号
+    uint slice = id.z;
+
+    for (uint i = tid; i < N; i += FFT_THREADS)
+        gFFT[i] = _TempSpectrumTexture[uint3(col, i, slice)];
+    GroupMemoryBarrierWithGroupSync();
+
+    FFTInPlace(tid, N, logN);
+
+    for (uint j = tid; j < N; j += FFT_THREADS)
+    {
+        float checker = (((col + j) & 1u) == 0u) ? 1.0f : -1.0f;
+        _SpectrumTexture[uint3(col, j, slice)] = gFFT[j] * checker;
+    }
+}
+
+// =====================================================================
+// [Kernel] 泡沫：每级联、全分辨率、跨帧累积
+// =====================================================================
+// 泡沫来自雅可比行列式 J：水面被挤压时 J < 1，挤压越狠越靠近浪尖，泡沫就在那里出现。
+//   J = (1 + ∂X/∂x)(1 + ∂Z/∂z) − (∂Z/∂x)²
+// 第三项是完整的 2×2 行列式里的非对角项（用无旋近似 ∂X/∂z ≈ ∂Z/∂x 补上另一个）。
+// 数据现成：位移层的 .a 就是 ∂Z/∂x，以前一直没人读。
+//
+// 为什么整段搬进 CS、而不是留在着色器里逐像素现算：
+//   1. 分辨率。这里每条线程对应级联贴图上的一个纹素，第 3 级是 3 厘米、第 0 级是 2 米。
+//      放在级联网格上，泡沫和位移天生共用一套网格、一套 uv、一套距离衰减 ——
+//      一个像素在远处覆盖几十厘米，逐像素现算只会采到亚像素噪声，采完就闪。
+//   2. 状态。泡沫是「浪尖破碎之后的残留」，生成得快、消失得慢，必须跨帧累积。
+//      像素着色器没有跨帧状态，所以这一步只能在这里做。
+//
+// 递推式（和参考实现同形，但补了帧率归一）：
+//   foam = saturate(foam * decay + add * max(0, bias − J^power))
+//
+//   注意这是「乘衰减 + 加增量」，不是 lerp(prev, cur, a)：
+//   lerp 的输出永远夹在 prev 和 cur 之间，输入是噪声时它只会贴着噪声的下包络跑，
+//   越积越多（上一版就是这么把整片海糊成雪原的）；
+//   乘加式先衰减再叠加，中性输入时自己回 0，而且被 saturate 卡住上界。
+
+float _FoamDecay;       // 每帧保留比例（C# 用 pow(retention, dt) 换算，帧率无关）
+float _FoamAdd;         // 每帧增量（C# 用速率 × dt 换算，帧率无关）
+float _FoamThreshold;   // J 的判定阈值：J 低于它才开始长泡沫（J 可以是负数，见下面）
+float _FoamJPower;      // 破碎量的幂次，越高越只认折叠最深的地方
+float _FoamChoppiness;  // 水平位移的缩放，必须和材质上的 Displacement Scale 一致
+float _FoamDetail;      // 逐纹素阈值抖动的幅度：把泡沫边缘打碎，避免大块平滑的白斑
+float _FoamCrestBias;   // 浪脊坡度门槛：坡度低于它的地方不出泡沫
+float _FoamCrestRange;  // 浪脊坡度的过渡宽度
+float _FoamReset;       // 1 = 丢掉历史，这一帧从 0 开始
+
+// 4 层 = 4 个级联，各自和自己的位移/斜率贴图同分辨率、同 uv、同平铺。
+// 用 float4 是为了和 ARGBFloat 的格式对上（D3D 的 typed UAV 要求格式一致），实际只用 .r。
+// 就地读写：每个线程只碰自己那一个纹素（先读、再算、再写回），线程之间没有交集，
+// 所以不需要双缓冲。
+RWTexture2DArray<float4> _FoamTexture;
+
+// 第 cascade 级的物理边长（米）。_LengthScale 就是 CS_InitializeSpectrum 用的那个。
+float CascadeLengthCS(int cascade)
+{
+    return cascade == 0 ? _LengthScale.x :
+           cascade == 1 ? _LengthScale.y :
+           cascade == 2 ? _LengthScale.z : _LengthScale.w;
+}
+
+[numthreads(8,8,1)]
+void CS_UpdateFoam(uint3 id : SV_DispatchThreadID)
+{
+    // 分辨率直接从贴图维度拿，不依赖外部 SetFloat 设的 _Resolution：
+    // .compute 被重新导入后，运行时用 SetFloat 写进去的值会全部丢失，
+    // 那时它变成 0，这里就会把所有线程直接 return 掉 ——
+    // 表面上一切正常，泡沫却永远是空的。
+    uint resW, resH, resLayers;
+    _SpectrumTexture.GetDimensions(resW, resH, resLayers);
+    if (id.x >= resW || id.y >= resH)
+        return;
+
+    uint res = resW;
+    int level = (int)id.z;
+
+    // 这个纹素在世界里对应哪一点：第 level 级是一张 L_level 米见方的周期贴图
+    float2 worldXZ = (float2(id.xy) + 0.5f) / (float)res * max(CascadeLengthCS(level), 1e-3f);
+
+    // ---------------------------------------------------------------
+    // 合计梯度：只把「本级 + 所有更粗的级」加起来
+    // ---------------------------------------------------------------
+    // 水面高度是 4 级位移相加，所以真实挤压是「和」的雅可比，
+    // 不是 4 个分别算出来的 J 再相加。上一版就是把 4 级 foam 直接相加，
+    // 4 个各自偏白的值一叠加，整片海必然全白。
+    //
+    // 为什么不把更细的级（j > level）也算进来：那一级的波长比本级纹素还短，
+    // 点采样抓不住，只会变成随机的黑白噪点。
+    // 于是每一级都是自洽的：c0 只有大浪，c3 是「大浪 + 中浪 + 细浪」的完整结果，
+    // 着色器按距离由细到粗往下退，任何时候拿到的都是「当时能分辨的最全的一份」。
+    float dXdx = 0.0f;
+    float dZdz = 0.0f;
+    float dZdx = 0.0f;
+    float dYdx = 0.0f; // 高度对 x 的斜率，用来认「浪脊」
+    float dYdz = 0.0f;
+
+    [loop]
+    for (int j = 0; j <= level; j++)
+    {
+        // uv 允许超出 [0,1)：级联贴图是周期的，下面自己做 wrap。
+        //
+        // 这里必须双线性插值，不能直接取最近邻。原因是「阶梯」：
+        // 细级（比如 c3，世界边长 15 米）要叠加粗级 c0（1000 米）的梯度，
+        // 一个 c0 纹素盖住 64 个 c3 纹素，最近邻会让 J 变成一块块边缘笔直的
+        // 阶梯常量，渲染出来水面上就是一个个人眼可见的方块。插值之后这些
+        // 大尺度贡献变成平滑过渡，方块自然消失。
+        // RWTexture 没有 Sample 方法，只能自己取 4 个邻居手动插值。
+        float2 uv = worldXZ / max(CascadeLengthCS(j), 1e-3f);
+        float2 t = frac(uv) * (float)res;
+        uint2  p0 = (uint2)t;
+        uint2  p1 = (p0 + 1u) % res;
+        float2 f = t - (float2)p0;
+
+        uint dispSlice  = (uint)j * 2u;
+        uint slopeSlice = (uint)j * 2u + 1u;
+
+        float4 d00 = _SpectrumTexture[uint3(p0.x, p0.y, dispSlice)];
+        float4 d10 = _SpectrumTexture[uint3(p1.x, p0.y, dispSlice)];
+        float4 d01 = _SpectrumTexture[uint3(p0.x, p1.y, dispSlice)];
+        float4 d11 = _SpectrumTexture[uint3(p1.x, p1.y, dispSlice)];
+        float4 disp = lerp(lerp(d00, d10, f.x), lerp(d01, d11, f.x), f.y); // r=X g=Z b=Y a=dz/dx
+
+        float4 s00 = _SpectrumTexture[uint3(p0.x, p0.y, slopeSlice)];
+        float4 s10 = _SpectrumTexture[uint3(p1.x, p0.y, slopeSlice)];
+        float4 s01 = _SpectrumTexture[uint3(p0.x, p1.y, slopeSlice)];
+        float4 s11 = _SpectrumTexture[uint3(p1.x, p1.y, slopeSlice)];
+        float4 slope = lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y); // r=dY/dx g=dY/dz b=dX/dx a=dZ/dz
+
+        dXdx += slope.b;
+        dZdz += slope.a;
+        dZdx += disp.a;
+        dYdx += slope.r;
+        dYdz += slope.g;
+    }
+
+    // 位移和它的导数乘同一个缩放：物理上 x = s*dX，所以 dx/dX 里也有一个 s。
+    // （J = det(I + s*grad d)，非对角元也是 s 量级，所以交叉项是 s^2 而不是 s^4。）
+    dXdx *= _FoamChoppiness;
+    dZdz *= _FoamChoppiness;
+    dZdx *= _FoamChoppiness;
+
+    float jacobian = (1.0f + dXdx) * (1.0f + dZdz) - dZdx * dZdx;
+
+    // 逐纹素抖动阈值：J 的等值线本身是平滑的，直接卡阈值会得到大块平滑白斑；
+    // 加一点逐纹素噪声把等值线打碎，再靠跨帧累积磨圆，边缘才像泡沫而不是积雪。
+    jacobian += (Hash(id.xy) - 0.5f) * _FoamDetail;
+
+    // J 可以小于 0：水平位移把网格翻了过去，水面在这里是「折叠」的 ——
+    // 那正是浪要破碎的地方。所以这里先算「压过头多少」再看它有多深：
+    //   crush = saturate(阈值 − J)    折叠越深，crush 越大
+    // 上一版写的是 max(0, 阈值 − J^2) 且 J 先被 saturate 到 [0,1]，
+    // 所有折叠区一律变成同一个常量，于是整片海糊成一块均匀的白 ——
+    // 差别不在「有没有泡沫」，而在「深浅不同的折叠分不出来」。
+
+    float prev = _FoamReset > 0.5f ? 0.0f : _FoamTexture[id].r;
+    float crush = saturate(_FoamThreshold - jacobian);
+    float generated = pow(crush, _FoamJPower);
+
+    // 浪脊遮罩：真实的破碎浪花是贴着浪脊的一条条，而不是按面积平均铺满整片海。
+    // 只用 J 的话，大片缓坡上 J 也会略小于 1，crush 处处为正，
+    // 渲出来就是一条从近到远都很均匀的白带（怎么调阈值都改不掉这个形状）。
+    // 坡度（高度梯度）在浪脊处最大、在浪谷和缓坡处接近 0，正好可以当「是不是浪脊」的判据。
+    // 坡度乘同一个 _FoamChoppiness，和渲染时位移的缩放保持一致。
+    float steepness = length(float2(dYdx, dYdz)) * _FoamChoppiness;
+    float crest = saturate((steepness - _FoamCrestBias) / max(_FoamCrestRange, 1e-4f));
+    generated *= crest;
+
+    _FoamTexture[id] = float4(saturate(prev * _FoamDecay + _FoamAdd * generated), 0.0f, 0.0f, 0.0f);
+}
