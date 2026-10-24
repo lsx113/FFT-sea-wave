@@ -421,13 +421,8 @@ void CS_FFTVertical(uint3 id : SV_DispatchThreadID)
 //   2. 状态。泡沫是「浪尖破碎之后的残留」，生成得快、消失得慢，必须跨帧累积。
 //      像素着色器没有跨帧状态，所以这一步只能在这里做。
 //
-// 递推式（和参考实现同形，但补了帧率归一）：
+// 递推式
 //   foam = saturate(foam * decay + add * max(0, bias − J^power))
-//
-//   注意这是「乘衰减 + 加增量」，不是 lerp(prev, cur, a)：
-//   lerp 的输出永远夹在 prev 和 cur 之间，输入是噪声时它只会贴着噪声的下包络跑，
-//   越积越多（上一版就是这么把整片海糊成雪原的）；
-//   乘加式先衰减再叠加，中性输入时自己回 0，而且被 saturate 卡住上界。
 
 float _FoamDecay;       // 每帧保留比例（C# 用 pow(retention, dt) 换算，帧率无关）
 float _FoamAdd;         // 每帧增量（C# 用速率 × dt 换算，帧率无关）
@@ -457,9 +452,6 @@ float CascadeLengthCS(int cascade)
 void CS_UpdateFoam(uint3 id : SV_DispatchThreadID)
 {
     // 分辨率直接从贴图维度拿，不依赖外部 SetFloat 设的 _Resolution：
-    // .compute 被重新导入后，运行时用 SetFloat 写进去的值会全部丢失，
-    // 那时它变成 0，这里就会把所有线程直接 return 掉 ——
-    // 表面上一切正常，泡沫却永远是空的。
     uint resW, resH, resLayers;
     _SpectrumTexture.GetDimensions(resW, resH, resLayers);
     if (id.x >= resW || id.y >= resH)
@@ -475,13 +467,6 @@ void CS_UpdateFoam(uint3 id : SV_DispatchThreadID)
     // 合计梯度：只把「本级 + 所有更粗的级」加起来
     // ---------------------------------------------------------------
     // 水面高度是 4 级位移相加，所以真实挤压是「和」的雅可比，
-    // 不是 4 个分别算出来的 J 再相加。上一版就是把 4 级 foam 直接相加，
-    // 4 个各自偏白的值一叠加，整片海必然全白。
-    //
-    // 为什么不把更细的级（j > level）也算进来：那一级的波长比本级纹素还短，
-    // 点采样抓不住，只会变成随机的黑白噪点。
-    // 于是每一级都是自洽的：c0 只有大浪，c3 是「大浪 + 中浪 + 细浪」的完整结果，
-    // 着色器按距离由细到粗往下退，任何时候拿到的都是「当时能分辨的最全的一份」。
     float dXdx = 0.0f;
     float dZdz = 0.0f;
     float dZdx = 0.0f;
