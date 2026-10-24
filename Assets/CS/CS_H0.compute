@@ -188,7 +188,7 @@ float2 ComputeH0(uint2 pid, uint cascade)
 void CS_InitializeSpectrum(uint3 id : SV_DispatchThreadID)
 {
     // 显式转成 float 和 _Resolution 同类型比较，避免 uint/float 混比的隐式转换警告。
-    // 注意是 >= 不是 >：分辨率 256 时合法 id 只有 0~255，id == 256 已经越界了
+    // 注意是 >= 不是 >：分辨率 512 时合法 id 只有 0~511，id == 512 已经越界了
     if ((float)id.x >= _Resolution || (float)id.y >= _Resolution)
         return; // 超过分辨率直接退出
 
@@ -422,7 +422,8 @@ void CS_FFTVertical(uint3 id : SV_DispatchThreadID)
 //      像素着色器没有跨帧状态，所以这一步只能在这里做。
 //
 // 递推式
-//   foam = saturate(foam * decay + add * max(0, bias − J^power))
+//   crush = saturate(threshold − J)          // J 保留负值，折叠越深 crush 越大
+//   foam  = saturate(foam * decay + add * pow(crush, power))
 
 float _FoamDecay;       // 每帧保留比例（C# 用 pow(retention, dt) 换算，帧率无关）
 float _FoamAdd;         // 每帧增量（C# 用速率 × dt 换算，帧率无关）
