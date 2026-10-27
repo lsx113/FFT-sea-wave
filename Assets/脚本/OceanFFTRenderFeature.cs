@@ -27,12 +27,6 @@ using UnityEngine.Rendering.Universal;
 //   Add Renderer Feature → OceanFFTRenderFeature。
 // =====================================================================
 
-/// <summary>
-/// Renderer Feature：URP 会把它当成渲染管线的「插件」，
-/// 每帧调用 AddRenderPasses，由我们决定往队列里塞什么 pass。
-/// 它继承自 ScriptableRendererFeature，不是 MonoBehaviour，所以不能挂在 GameObject 上，
-/// 只能挂到 Renderer 资产里。
-/// </summary>
 public class OceanFFTRenderFeature : ScriptableRendererFeature
 {
     [Header("时间")]
