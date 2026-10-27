@@ -437,7 +437,7 @@ float CascadeFade(int cascade, float3 worldPos)
 | `_DisplaceFadeDistance` / `Falloff`                      | 400 / 1.2     | 远处几何压平的距离与幂次                 |
 | `_FoamEdgePower` / `_FoamDepthAttenuation`               | 2.77 / 17.8   | 泡沫边缘收紧 / 距离衰减幂次              |
 | `_FoamNoiseScale` / `_FoamNoiseContrast`                 | 1.54 / 1.31   | 絮状遮罩的频率与对比度                  |
-| `_FresnelStrength` / `_EnvStrength`                      | 0.63 / 1      | 菲涅尔强度 / 环境反射强度               |
+| `_FresnelStrength` / `_EnvStrength`                      | 0.48 / 1      | 菲涅尔强度 / 环境反射强度               |
 | `_CrestHeight` / `_SunBodyStrength` / `_ScatterStrength` | 3 / 0.35 / 2  | 浪尖透光的高度尺度 / 直接光对水体的贡献 / 散射强度 |
 
 #### 2.10 运行

@@ -39,7 +39,7 @@ Material:
     - _FoamSoftness: 0.22
     - _FoamThreshold: 0.78
     - _FoamTrail: 0.7
-    - _FresnelStrength: 0.63
+    - _FresnelStrength: 0.48
     - _NormalStrength: 1
     - _Roughness: 0.16
     - _RoughnessBoost: 1.5
