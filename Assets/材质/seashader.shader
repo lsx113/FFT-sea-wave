@@ -35,7 +35,7 @@ Shader "Custom/seashader"
         _LayerContribute ("Layer Contribute 各级联权重 xyzw=L0 L1 L2 L3", Vector) = (1, 1, 1, 1)
 
         [Header(Tessellation)]
-        _TessMax ("Tess Near 近处细分", Range(1, 32)) = 8
+        _TessMax ("Tess Near 近处细分", Range(1, 64)) = 32
         _TessMin ("Tess Far 远处细分", Range(1, 16)) = 1
         _TessDistance ("Tess Distance 衰减距离(米)", Range(1, 2000)) = 200
     }
@@ -227,8 +227,25 @@ Shader "Custom/seashader"
                 return pow(t, max(_DisplaceFadeFalloff, 1e-3));
             }
 
-            // 世界空间位移 (X, Y, Z)，Y 是高度
-            float3 SampleDisplacement(float3 worldPos)
+            // 几何侧的带限：一层的波纹能不能被「这种密度的三角形」表达，取决于三角形边长，
+            // 不取决于像素足迹。
+            // 级联 i 的最短波长是 2 个纹素（它的网格自身的 Nyquist）；要让它看起来是一个波、
+            // 而不是逐顶点随机的高度跳变，最短波长至少要盖住 4 个采样点，
+            // 也就是顶点间距 h <= 纹素 / 2。
+            //   1 = h 远小于纹素/2，这层在几何上完全可表达
+            //   0 = h 已经到一个纹素，这层在几何上就是噪声，必须撤掉
+            // 只有位移吃这个限制。法线（SampleDetail）仍然按像素足迹淡出 —— 高频细节
+            // 交给法线去做，几何只负责"能站得住的那一半"，和贴法线贴图是同一个分工。
+            float GeometryBandLimit(int cascade, float meshStep)
+            {
+                float texel = CascadeLength(cascade) / max(_OceanResolution, 1.0);
+                float halfTexel = 0.5 * texel;
+                return 1.0 - saturate((meshStep - halfTexel) / halfTexel);
+            }
+
+            // 世界空间位移 (X, Y, Z)，Y 是高度。
+            // meshStep = 这个 patch 细分后一条三角形边的实际长度（米）。
+            float3 SampleDisplacement(float3 worldPos, float meshStep)
             {
                 float3 acc = float3(0.0, 0.0, 0.0);
                 [unroll]
@@ -237,7 +254,7 @@ Shader "Custom/seashader"
                     float4 s = SAMPLE_TEXTURE2D_ARRAY_LOD(
                         _OceanSpectrum, sampler_OceanSpectrum, CascadeUV(worldPos.xz, i), i * 2, 0);
 
-                    float w = CascadeFade(i, worldPos) * LayerWeight(i);
+                    float w = CascadeFade(i, worldPos) * GeometryBandLimit(i, meshStep) * LayerWeight(i);
 
                     acc.x += s.r * w; // 水平位移 X
                     acc.y += s.b * w; // 垂直位移 Y（高度）
@@ -359,9 +376,19 @@ Shader "Custom/seashader"
                                     patch[1].positionWS * bary.y +
                                     patch[2].positionWS * bary.z;
 
+                // 这个 patch 细分之后，一条三角形边实际有多长（米）。
+                // 几何能表达的最高频率由它决定，而不是由像素决定 —— 相机贴近水面时
+                // 像素足迹会一直变小，三角形边长却被 _TessMax 卡死在十几厘米，
+                // 两者一旦拉开 4 倍以上，波长比三角形还短的级联就变成了逐顶点随机起伏，
+                // 渲出来是一块块边缘笔直的碎板（揉皱的锡纸）。这里把它算出来交给位移采样去过带限。
+                float e0 = distance(patch[0].positionWS, patch[1].positionWS);
+                float e1 = distance(patch[1].positionWS, patch[2].positionWS);
+                float e2 = distance(patch[2].positionWS, patch[0].positionWS);
+                float meshStep = min(min(e0, e1), e2) / max(factors.inside, 1.0);
+
                 // 用「位移前」的世界 XZ 去查谱：
                 // 频谱是定义在静止平面上的，不能拿位移后的坐标去查（会自己追自己）
-                float3 displacement = SampleDisplacement(positionWS) * _DisplacementScale;
+                float3 displacement = SampleDisplacement(positionWS, meshStep) * _DisplacementScale;
 
                 // 远处的位移整体收掉，地平线才是一条水平线而不是一串浪尖
                 positionWS += displacement * DisplacementFade(positionWS);
