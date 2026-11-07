@@ -3,6 +3,16 @@
 Unity **6000.3.10f1** / URP **17.3**（Render Graph）。基于**海洋波谱 + 二维逆 FFT** 的实时海面：
 每帧在 GPU 上用 Compute Shader 求解一次波动方程的解，着色器端做曲面细分位移、斜率重建法线、菲涅尔反射与含跨帧累积的白浪泡沫。
 
+## 项目概要
+
+> 一页版摘要，所有数字都与后文一致；细节和踩坑见下面的正文。
+
+- **管线移植** —— 把基于 Built-in 管线的开源 [gasgiant/FFT-Ocean](https://github.com/gasgiant/FFT-Ocean) 改写为 URP 17 **Render Graph** 结构：4 段 Compute（时间演化 / 行 IFFT / 列 IFFT / 泡沫累积）录进同一个 `UnsafePass`，几何仍交给 URP 的不透明 Pass；修掉「全局纹理对资源追踪不可见 → Pass 被判定为空 → 整个被裁掉 → 海面塌成一块平面」的问题。
+- **GPU 波谱求解** —— JONSWAP 频率谱 × Mitsuyasu 方向扩散 × 4 级级联带通生成初值频谱；每帧 4 次 `Dispatch` 完成时间演化、行/列 IFFT 与泡沫累积。512² 一次逆变换出 **32 个实场**（8 个数组切片 = 16 个复场，每级是 3 个位移分量 + 5 个偏导）。4 级合计约 **52 万个独立的波**（每级 512² 个复模态，含共轭冗余共 105 万），成本与波数无关；IFFT 用 `groupshared` 装整行、256 线程一组。
+- **着色与细分** —— Domain 阶段用**位移前**的世界坐标查谱位移顶点，片元阶段用同一次 IFFT 顺带导出的偏导重建法线；位移另外做**几何带限**（按三角形边长 vs 级联纹素），把当前顶点密度表达不了的级联从位移里剔掉、只留给法线；自定义水体光照（菲涅尔 F0 = 0.02、天空反射、太阳高光、浪尖透光），不走 `UniversalFragmentPBR`。
+- **泡沫重构** —— 把泡沫从「着色器逐像素现算 + 一张粗粒度世界历史图」改成「Compute 按级联纹素计算 + 每级独立历史图」，修掉最近邻采样（方块）、四级泡沫相加（全白）、`J²` + `saturate` 抹平破碎深度、缺距离衰减与足迹带限（远处雪花闪烁）四个缺陷，屏幕可见覆盖率由糊成一片压到约一成。
+- **结果** —— 500 m × 500 m 海面（基础网格 26.3 万顶点 / 52.4 万三角面，近处细分后等效顶点间距约 13 cm），纹理约 96 MB 显存、每帧约 190 MB 带宽，编辑器内实测约 118 fps。
+
 ## FFT 海面技术
 
 ### 1. 技术方案
@@ -285,6 +295,26 @@ Varyings DomainProgram(TessFactors factors, OutputPatch<Varyings, 3> patch, floa
 | `#pragma target` | **4.6**                                         | 低于这个值 hull/domain 会被编译器直接丢掉，shader 静默退回顶点着色器——表现是"位移完全没效果"，且不报错                                    |
 | 距离衰减             | `DisplacementFade` 把位移整体压平                      | 远处的浪在屏幕上只有几像素，保持满幅只会把地平线堆成一列锯齿状的山                                                                  |
 
+**位移的几何带限（`GeometryBandLimit`）。** 「某一级该不该淡出」和「某一级能不能被这种密度的三角形表达」是两件事，而 `CascadeFade` 只看像素足迹：相机贴近水面时像素足迹一直变小，c2 / c3 于是永远全额参与位移；可三角形边长被 `_TessMax` 卡住不再变细。一旦三角形比某级的最短波长还长，那级的位移就退化成"每个顶点一个随机高度"，渲出来是一块块边缘笔直的碎板（揉皱的锡纸），而且**细分越高越清楚**——因为更密的网格更忠实地把频谱在那一段的重建失真画了出来。
+
+所以 Domain 阶段先把"这个 patch 细分之后一条边有多长"算出来，再交给位移采样去过滤：
+
+```hlsl
+float e0 = distance(patch[0].positionWS, patch[1].positionWS);
+float e1 = distance(patch[1].positionWS, patch[2].positionWS);
+float e2 = distance(patch[2].positionWS, patch[0].positionWS);
+float meshStep = min(min(e0, e1), e2) / max(factors.inside, 1.0);   // 细分后的一条边（米）
+
+// 顶点间距 h <= 纹素 / 2（最短波长至少盖住 4 个采样点）才允许参与位移
+float GeometryBandLimit(int cascade, float meshStep)
+{
+    float halfTexel = 0.5 * CascadeLength(cascade) / max(_OceanResolution, 1.0);
+    return 1.0 - saturate((meshStep - halfTexel) / halfTexel);
+}
+```
+
+只有位移吃这个限制，**法线（`SampleDetail`）仍然按像素足迹淡出**：高频细节交给法线，几何只承载"站得住"的那一半——和法线贴图是同一个分工。按 `_TessMax = 7.4`（三角形约 13 cm）算，c2（纹素 12 cm）和 c3（3 cm）在近处被剔出位移，只留 c0 / c1；把 `_TessMax` 提到 24 左右 c2 才会重新进来（那时三角形 4 cm，c2 的最短波长有 6 个采样点）。这也意味着**细分不再是纯粹的性能旋钮**：调低它会把几何细节一起收掉，调高它就必须同时确认频谱在该级的 Nyquist 附近已经收干净。
+
 级联的换算关系也在这里：`CascadeUV(worldXZ, i) = worldXZ / L_i`，也就是说**每个级联就是一张 `L_i` 米见方的周期贴图**，平铺由采样模式（Repeat）完成，不需要另外存偏移。
 
 | 级联  | 物理边长 `L` | 纹素尺寸（N = 512） | 最短波长 `2L/N`                   |
@@ -433,7 +463,7 @@ float CascadeFade(int cascade, float3 worldPos)
 | -------------------------------------------------------- | ------------- | ---------------------------- |
 | `_DisplacementScale`                                     | 0.42          | 位移整体的缩放，直接决定浪高               |
 | `_Roughness` / `_RoughnessBoost`                         | 0.16 / 1.5    | 基础粗糙度 / 丢失细节折算成粗糙度的系数        |
-| `_TessMax` / `_TessMin` / `_TessDistance`                | 7.4 / 1 / 408 | 细分因子随距离从 7.4 线性降到 1 的距离      |
+| `_TessMax` / `_TessMin` / `_TessDistance`                | 7.4 / 1 / 408 | 细分因子随距离从 `_TessMax`（可调 1–64）线性降到 1 的距离；调它等于同时调几何带限 |
 | `_DisplaceFadeDistance` / `Falloff`                      | 400 / 1.2     | 远处几何压平的距离与幂次                 |
 | `_FoamEdgePower` / `_FoamDepthAttenuation`               | 2.77 / 17.8   | 泡沫边缘收紧 / 距离衰减幂次              |
 | `_FoamNoiseScale` / `_FoamNoiseContrast`                 | 1.54 / 1.31   | 絮状遮罩的频率与对比度                  |
@@ -614,7 +644,7 @@ float roughness = sqrt(_Roughness * _Roughness + (od.lostSlope2 + lostFromGeo) *
 
 - 4 级级联 × 512²，最短可表示的波长 6.1 cm（ω ≈ 31.7 rad/s ≈ 5 Hz），波高 / 法线 / 泡沫全部由同一套谱导出，没有一处手写噪声充当"浪"；
 - `ω` 量化到 `2π/200 s`，海面 200 s 无缝循环，边界不需要任何处理；
-- 500 m × 500 m 网格、26.3 万顶点 / 52.4 万三角形，细分因子随距离从 7.4 降到 1（408 m 处）；
+- 500 m × 500 m 网格、26.3 万顶点 / 52.4 万三角形，细分因子随距离从 7.4 降到 1（408 m 处），并按三角形边长对位移做几何带限；
 - 纹理占用约 96 MB 显存，每帧约 190 MB 带宽，全部在 GPU 上，CPU 只发 dispatch 和 `SetGlobal`；
 - 泡沫近处成条、贴着浪脊，30 m 外自动退回低频、120 m 外基本消失，看不出闪烁；
 - 光照不走 PBR：掠射角下整片海是天空的颜色，垂直看下去露出水体的青绿，逆光时浪尖透光。
